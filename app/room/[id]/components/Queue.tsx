@@ -1,15 +1,7 @@
 "use client";
 
 import { useState } from 'react';
-
-interface Song {
-  id: string;
-  name: string;
-  artist: string;
-  image: string;
-  youtubeId: string;
-  votes?: number;
-}
+import { Song } from '@/app/types';
 
 interface QueueProps {
   queue: Song[];

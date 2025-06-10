@@ -1,26 +1,30 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
+import { Song } from '@/app/types';
 
 interface SearchProps {
   roomId: string;
+  onAddSong: (song: Song) => Promise<void>;
 }
 
-export default function Search({ roomId }: SearchProps) {
+export default function Search({ roomId, onAddSong }: SearchProps) {
   const [query, setQuery] = useState('');
-  const [results, setResults] = useState<any[]>([]);
+  const [results, setResults] = useState<Song[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
 
-  const handleSearch = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!query.trim()) return;
+  const searchSongs = useCallback(async (searchQuery: string) => {
+    if (!searchQuery.trim()) {
+      setResults([]);
+      return;
+    }
 
     setIsLoading(true);
     setError('');
 
     try {
-      const response = await fetch(`/api/youtube/search?q=${encodeURIComponent(query)}`);
+      const response = await fetch(`/api/youtube/search?q=${encodeURIComponent(searchQuery)}`);
       if (!response.ok) {
         throw new Error('Failed to search songs');
       }
@@ -28,26 +32,24 @@ export default function Search({ roomId }: SearchProps) {
       setResults(data);
     } catch (error) {
       setError('Failed to search songs. Please try again.');
+      setResults([]);
     } finally {
       setIsLoading(false);
     }
-  };
+  }, []);
 
-  const handleAddSong = async (song: any) => {
+  // Debounced search effect
+  useEffect(() => {
+    const timeoutId = setTimeout(() => {
+      searchSongs(query);
+    }, 500); // 500ms delay
+
+    return () => clearTimeout(timeoutId);
+  }, [query, searchSongs]);
+
+  const handleAddSong = async (song: Song) => {
     try {
-      const response = await fetch(`/api/rooms/${roomId}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'add-song',
-          data: { song }
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to add song');
-      }
-
+      await onAddSong(song);
       // Clear search results after adding
       setResults([]);
       setQuery('');
@@ -58,7 +60,7 @@ export default function Search({ roomId }: SearchProps) {
 
   return (
     <div className="space-y-4">
-      <form onSubmit={handleSearch} className="flex space-x-2">
+      <div className="flex space-x-2">
         <input
           type="text"
           value={query}
@@ -66,14 +68,12 @@ export default function Search({ roomId }: SearchProps) {
           placeholder="Search for songs..."
           className="flex-1 px-4 py-2 border border-gray-200 rounded-lg focus:ring-2 focus:ring-[#DD88CF] focus:border-transparent outline-none transition-all duration-200"
         />
-        <button
-          type="submit"
-          disabled={isLoading}
-          className="px-4 py-2 bg-[#DD88CF] hover:bg-[#4B164C] text-white font-semibold rounded-lg transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          {isLoading ? 'Searching...' : 'Search'}
-        </button>
-      </form>
+        {isLoading && (
+          <div className="px-4 py-2 text-[#4B164C] font-semibold">
+            Searching...
+          </div>
+        )}
+      </div>
 
       {error && (
         <div className="bg-red-50 border border-red-200 text-red-600 px-4 py-3 rounded-lg text-sm">

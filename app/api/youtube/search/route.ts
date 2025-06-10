@@ -42,13 +42,13 @@ export async function GET(request: NextRequest) {
 
     const data = await response.json();
     
-    // Format the results
+    // Format the results to match the expected format in Search component
     const formattedResults = data.items.map((item: any) => ({
-      videoId: item.id.videoId,
-      title: item.snippet.title,
-      thumbnail: item.snippet.thumbnails.high?.url || item.snippet.thumbnails.default?.url,
-      channelTitle: item.snippet.channelTitle,
-      publishedAt: item.snippet.publishedAt
+      id: item.id.videoId,
+      name: item.snippet.title,
+      artist: item.snippet.channelTitle,
+      image: item.snippet.thumbnails.high?.url || item.snippet.thumbnails.default?.url,
+      youtubeId: item.id.videoId
     }));
 
     return NextResponse.json(formattedResults);

@@ -14,10 +14,14 @@ export async function subscribeToRoom(roomId: string, onMessage: (event: RoomEve
   const channel = `room:${roomId}`;
   
   // Subscribe to Redis channel
-  const subscriber = redis.subscribe(channel, (message: string) => {
+  const subscriber = redis.subscribe(channel);
+  
+  // Handle messages
+  subscriber.on('message', (event) => {
     try {
-      const event = JSON.parse(message) as RoomEvent;
-      onMessage(event);
+      const message = event.message as string;
+      const parsedEvent = JSON.parse(message) as RoomEvent;
+      onMessage(parsedEvent);
     } catch (error) {
       console.error('Error parsing SSE message:', error);
     }

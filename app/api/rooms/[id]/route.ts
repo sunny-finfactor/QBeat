@@ -30,8 +30,14 @@ export async function GET(
     const roomId = params.id;
     
     // Check if room exists by looking for queue or playback state
-    const queue = await redis.get(`room:${roomId}:queue`);
-    const playbackState = await redis.get(`room:${roomId}:playbackState`);
+    const queue = await redis.get(`room:${roomId}:queue`) as Song[] || [];
+    const playedSongs = await redis.get(`room:${roomId}:playedSongs`) as Song[] || [];
+    const playbackState = await redis.get(`room:${roomId}:playbackState`) as PlaybackState || {
+      currentSongId: null,
+      isPlaying: false,
+      currentTime: 0,
+      lastUpdate: Date.now()
+    };
 
     if (!queue && !playbackState) {
       return NextResponse.json(
@@ -41,13 +47,9 @@ export async function GET(
     }
 
     return NextResponse.json({
-      queue: queue || [],
-      playbackState: playbackState || {
-        currentSongId: null,
-        isPlaying: false,
-        currentTime: 0,
-        lastUpdate: Date.now()
-      },
+      queue,
+      playedSongs,
+      playbackState,
       isAdmin: true // You can implement proper admin check here
     });
   } catch (error) {
@@ -73,6 +75,7 @@ export async function POST(
 
     const roomId = params.id;
     const queue = (await redis.get(`room:${roomId}:queue`)) as Song[] || [];
+    const playedSongs = (await redis.get(`room:${roomId}:playedSongs`)) as Song[] || [];
     const playbackState = (await redis.get(`room:${roomId}:playbackState`)) as PlaybackState || {
       currentSongId: null,
       isPlaying: false,
@@ -84,6 +87,7 @@ export async function POST(
       case 'create-room': {
         // Initialize room state
         await redis.set(`room:${roomId}:queue`, []);
+        await redis.set(`room:${roomId}:playedSongs`, []);
         await redis.set(`room:${roomId}:playbackState`, {
           currentSongId: null,
           isPlaying: false,
@@ -121,6 +125,11 @@ export async function POST(
           return NextResponse.json({ error: 'Song ID is required' }, { status: 400 });
         }
 
+        // Don't allow voting for the currently playing song
+        if (data.songId === playbackState.currentSongId) {
+          return NextResponse.json({ error: 'Cannot vote for currently playing song' }, { status: 400 });
+        }
+
         const newQueue = queue.map(song => 
           song.id === data.songId 
             ? { ...song, votes: (song.votes || 0) + 1 }
@@ -136,31 +145,32 @@ export async function POST(
           return NextResponse.json({ error: 'Song ID is required' }, { status: 400 });
         }
 
-        const newQueue = queue.filter(song => song.id !== data.songId);
-        await redis.set(`room:${roomId}:queue`, newQueue);
-
-        // If we removed the current song, update playback state
-        if (playbackState.currentSongId === data.songId) {
-          const nextSong = newQueue[0];
-          const newPlaybackState = {
-            ...playbackState,
-            currentSongId: nextSong?.id || null,
-            isPlaying: !!nextSong,
-            currentTime: 0,
-            lastUpdate: Date.now()
-          };
-          await redis.set(`room:${roomId}:playbackState`, newPlaybackState);
-          return NextResponse.json({ queue: newQueue, playbackState: newPlaybackState });
+        // Don't allow removing the currently playing song
+        if (data.songId === playbackState.currentSongId) {
+          return NextResponse.json({ error: 'Cannot remove currently playing song' }, { status: 400 });
         }
 
+        const newQueue = queue.filter(song => song.id !== data.songId);
+        await redis.set(`room:${roomId}:queue`, newQueue);
         return NextResponse.json({ queue: newQueue });
       }
 
       case 'next-song': {
-        const currentIndex = queue.findIndex(song => song.id === playbackState.currentSongId);
-        const nextSong = queue[currentIndex + 1];
+        // Move current song to played songs if it exists
+        if (playbackState.currentSongId) {
+          const currentSong = queue.find(song => song.id === playbackState.currentSongId);
+          if (currentSong) {
+            const newPlayedSongs = [...playedSongs, currentSong];
+            await redis.set(`room:${roomId}:playedSongs`, newPlayedSongs);
+          }
+        }
 
+        // Get the next song (highest voted song in queue)
+        const nextSong = queue[0];
         if (nextSong) {
+          const newQueue = queue.slice(1); // Remove the next song from queue
+          await redis.set(`room:${roomId}:queue`, newQueue);
+
           const newPlaybackState = {
             ...playbackState,
             currentSongId: nextSong.id,
@@ -169,17 +179,32 @@ export async function POST(
             lastUpdate: Date.now()
           };
           await redis.set(`room:${roomId}:playbackState`, newPlaybackState);
-          return NextResponse.json({ playbackState: newPlaybackState });
+          return NextResponse.json({ 
+            queue: newQueue, 
+            playedSongs: playedSongs,
+            playbackState: newPlaybackState 
+          });
         }
 
         return NextResponse.json({ error: 'No next song available' }, { status: 400 });
       }
 
       case 'previous-song': {
-        const currentIndex = queue.findIndex(song => song.id === playbackState.currentSongId);
-        const previousSong = queue[currentIndex - 1];
+        // Move current song back to queue if it exists
+        if (playbackState.currentSongId) {
+          const currentSong = queue.find(song => song.id === playbackState.currentSongId);
+          if (currentSong) {
+            const newQueue = [currentSong, ...queue];
+            await redis.set(`room:${roomId}:queue`, newQueue);
+          }
+        }
 
+        // Get the last played song
+        const previousSong = playedSongs[playedSongs.length - 1];
         if (previousSong) {
+          const newPlayedSongs = playedSongs.slice(0, -1); // Remove the last played song
+          await redis.set(`room:${roomId}:playedSongs`, newPlayedSongs);
+
           const newPlaybackState = {
             ...playbackState,
             currentSongId: previousSong.id,
@@ -188,10 +213,32 @@ export async function POST(
             lastUpdate: Date.now()
           };
           await redis.set(`room:${roomId}:playbackState`, newPlaybackState);
-          return NextResponse.json({ playbackState: newPlaybackState });
+          return NextResponse.json({ 
+            queue: queue,
+            playedSongs: newPlayedSongs,
+            playbackState: newPlaybackState 
+          });
         }
 
         return NextResponse.json({ error: 'No previous song available' }, { status: 400 });
+      }
+
+      case 'replay-song': {
+        if (!data?.songId) {
+          return NextResponse.json({ error: 'Song ID is required' }, { status: 400 });
+        }
+
+        // Find the song in played songs
+        const songToReplay = playedSongs.find(song => song.id === data.songId);
+        if (!songToReplay) {
+          return NextResponse.json({ error: 'Song not found in played songs' }, { status: 404 });
+        }
+
+        // Add the song back to queue
+        const newQueue = [...queue, { ...songToReplay, votes: 0 }];
+        await redis.set(`room:${roomId}:queue`, newQueue);
+
+        return NextResponse.json({ queue: newQueue });
       }
 
       case 'pause-song': {
