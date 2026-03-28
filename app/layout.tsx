@@ -1,12 +1,21 @@
 import type { Metadata } from "next";
-import { Inter } from "next/font/google";
+import { Instrument_Serif, Space_Grotesk } from "next/font/google";
 import "./globals.css";
 
-const inter = Inter({ subsets: ["latin"] });
+const sans = Space_Grotesk({
+  subsets: ["latin"],
+  variable: "--font-sans",
+});
+
+const display = Instrument_Serif({
+  subsets: ["latin"],
+  weight: "400",
+  variable: "--font-display",
+});
 
 export const metadata: Metadata = {
-  title: "QBeat - Vote to Play Music",
-  description: "Create rooms and vote on songs to play together",
+  title: "QBeat",
+  description: "Realtime room-based YouTube voting built for Vercel-compatible serverless deployment.",
 };
 
 export default function RootLayout({
@@ -16,7 +25,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body className={inter.className}>{children}</body>
+      <body className={`${sans.variable} ${display.variable}`}>{children}</body>
     </html>
   );
 }

@@ -1,108 +1,209 @@
 "use client";
 
-import { useState } from 'react';
-import { Song } from '@/app/types';
+import Image from "next/image";
+import type { RoomTrack } from "@/app/types";
+import { canVoteForTrack } from "@/lib/qbeat/room-state";
 
 interface QueueProps {
-  queue: Song[];
-  roomId: string;
-  isAdmin: boolean;
+  upNextTrack: RoomTrack | null;
+  queuedTracks: RoomTrack[];
+  playedTracks: RoomTrack[];
+  votedTrackIds: string[];
+  isHost: boolean;
+  onVote: (roomTrackId: string) => Promise<void>;
+  onRemove: (roomTrackId: string) => Promise<void>;
 }
 
-export default function Queue({ queue, roomId, isAdmin }: QueueProps) {
-  const [votingSongId, setVotingSongId] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+interface TrackRowProps {
+  track: RoomTrack;
+  votedTrackIds: string[];
+  isHost: boolean;
+  onVote: (roomTrackId: string) => Promise<void>;
+  onRemove: (roomTrackId: string) => Promise<void>;
+  showVoting: boolean;
+}
 
-  const handleVote = async (songId: string) => {
-    try {
-      const response = await fetch(`/api/rooms/${roomId}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'vote-song',
-          data: { songId }
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to vote for song');
-      }
-    } catch (error) {
-      console.error('Error voting for song:', error);
-    }
-  };
-
-  const handleRemove = async (songId: string) => {
-    if (!isAdmin) return;
-
-    try {
-      const response = await fetch(`/api/rooms/${roomId}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'remove-song',
-          data: { songId }
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to remove song');
-      }
-    } catch (error) {
-      console.error('Error removing song:', error);
-    }
-  };
-
-  if (queue.length === 0) {
-    return (
-      <div className="text-center py-8">
-        <p className="text-gray-500">No songs in queue</p>
-      </div>
-    );
+function formatDuration(durationSeconds: number | null) {
+  if (!durationSeconds) {
+    return "Unknown";
   }
 
-  return (
-    <div className="space-y-2 max-h-[calc(100vh-24rem)] overflow-y-auto">
-      {queue.map((song) => (
-        <div
-          key={song.id}
-          className="flex items-center justify-between p-4 bg-[#F8E7F6] rounded-lg hover:bg-[#DD88CF] hover:text-white transition-colors duration-200"
-        >
-          <div className="flex items-center space-x-4">
-            <img
-              src={song.image}
-              alt={song.name}
-              className="w-12 h-12 rounded-lg"
-            />
-            <div>
-              <h3 className="font-medium">{song.name}</h3>
-              <p className="text-sm opacity-75">{song.artist}</p>
-            </div>
-          </div>
+  const minutes = Math.floor(durationSeconds / 60);
+  const seconds = durationSeconds % 60;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
 
-          <div className="flex items-center space-x-2">
-            <button
-              onClick={() => handleVote(song.id)}
-              className="p-2 text-[#4B164C] hover:text-white transition-colors"
-            >
-              <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" />
-              </svg>
-            </button>
-            <span className="text-sm font-medium">{song.votes || 0}</span>
-            {isAdmin && (
+function TrackRow({
+  track,
+  votedTrackIds,
+  isHost,
+  onVote,
+  onRemove,
+  showVoting,
+}: TrackRowProps) {
+  const alreadyVoted = votedTrackIds.includes(track.id);
+  const canVote = showVoting && canVoteForTrack(track, votedTrackIds);
+
+  return (
+    <article className="soft-card rounded-[24px] p-4">
+      <div className="flex gap-3">
+        <Image
+          src={track.thumbnail_url}
+          alt={track.title}
+          width={52}
+          height={52}
+          className="h-[52px] w-[52px] rounded-[16px] object-cover"
+        />
+
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-sm font-semibold text-[var(--text)]">{track.title}</p>
+          <p className="truncate text-sm text-[var(--text-muted)]">{track.artist}</p>
+          <p className="mt-1 text-xs uppercase tracking-[0.14em] text-[var(--text-muted)]">
+            {track.provider} · {formatDuration(track.duration_seconds)} · {track.vote_count} votes
+          </p>
+
+          <div className="mt-3 flex flex-wrap gap-2">
+            {showVoting ? (
               <button
-                onClick={() => handleRemove(song.id)}
-                className="p-2 text-[#4B164C] hover:text-white transition-colors"
+                type="button"
+                onClick={() => onVote(track.id)}
+                disabled={!canVote}
+                className={`rounded-full px-3 py-2 text-xs font-semibold transition ${
+                  canVote
+                    ? "bg-[var(--accent)] text-white hover:bg-[var(--accent-strong)]"
+                    : "cursor-not-allowed border border-[var(--line)] bg-white text-[var(--text-muted)]"
+                }`}
               >
-                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                </svg>
+                {alreadyVoted ? "Voted" : "Upvote"}
               </button>
-            )}
+            ) : null}
+
+            {isHost && showVoting ? (
+              <button
+                type="button"
+                onClick={() => onRemove(track.id)}
+                className="rounded-full border border-[rgba(194,64,50,0.22)] px-3 py-2 text-xs font-semibold text-[var(--danger)] transition hover:bg-[rgba(194,64,50,0.08)]"
+              >
+                Remove
+              </button>
+            ) : null}
           </div>
         </div>
-      ))}
+      </div>
+    </article>
+  );
+}
+
+function SectionShell({
+  title,
+  count,
+  description,
+  children,
+}: {
+  title: string;
+  count: string;
+  description: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="glass-panel rounded-[28px] p-5">
+      <div className="mb-4 flex items-start justify-between gap-3">
+        <div>
+          <p className="section-kicker">{title}</p>
+          <p className="mt-2 text-sm leading-6 text-[var(--text-muted)]">{description}</p>
+        </div>
+        <span className="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--text-muted)]">
+          {count}
+        </span>
+      </div>
+      <div className="space-y-3">{children}</div>
+    </section>
+  );
+}
+
+export default function Queue({
+  upNextTrack,
+  queuedTracks,
+  playedTracks,
+  votedTrackIds,
+  isHost,
+  onVote,
+  onRemove,
+}: QueueProps) {
+  return (
+    <div className="space-y-4">
+      <SectionShell
+        title="Up next"
+        count={upNextTrack ? "1 song" : "Empty"}
+        description="The immediate next song ready to take over after the current track."
+      >
+        {upNextTrack ? (
+          <TrackRow
+            track={upNextTrack}
+            votedTrackIds={votedTrackIds}
+            isHost={isHost}
+            onVote={onVote}
+            onRemove={onRemove}
+            showVoting
+          />
+        ) : (
+          <div className="rounded-[22px] border border-dashed border-[var(--line)] px-4 py-5 text-sm text-[var(--text-muted)]">
+            Nothing is waiting in the up next slot yet.
+          </div>
+        )}
+      </SectionShell>
+
+      <SectionShell
+        title="Queue"
+        count={`${queuedTracks.length} songs`}
+        description="The rest of the room queue. Permanent votes decide which one climbs."
+      >
+        <div className="space-y-3 xl:max-h-[20rem] xl:overflow-y-auto xl:pr-1">
+          {queuedTracks.length > 0 ? (
+            queuedTracks.map((track) => (
+              <TrackRow
+                key={track.id}
+                track={track}
+                votedTrackIds={votedTrackIds}
+                isHost={isHost}
+                onVote={onVote}
+                onRemove={onRemove}
+                showVoting
+              />
+            ))
+          ) : (
+            <div className="rounded-[22px] border border-dashed border-[var(--line)] px-4 py-5 text-sm text-[var(--text-muted)]">
+              The queue is empty behind the up next slot.
+            </div>
+          )}
+        </div>
+      </SectionShell>
+
+      <SectionShell
+        title="Played"
+        count={`${playedTracks.length} songs`}
+        description="Songs that already passed through this room session."
+      >
+        <div className="space-y-3 xl:max-h-[16rem] xl:overflow-y-auto xl:pr-1">
+          {playedTracks.length > 0 ? (
+            playedTracks.map((track) => (
+              <TrackRow
+                key={track.id}
+                track={track}
+                votedTrackIds={votedTrackIds}
+                isHost={false}
+                onVote={onVote}
+                onRemove={onRemove}
+                showVoting={false}
+              />
+            ))
+          ) : (
+            <div className="rounded-[22px] border border-dashed border-[var(--line)] px-4 py-5 text-sm text-[var(--text-muted)]">
+              Played songs will appear here after the room starts moving.
+            </div>
+          )}
+        </div>
+      </SectionShell>
     </div>
   );
 }

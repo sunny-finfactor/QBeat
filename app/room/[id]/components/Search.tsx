@@ -1,116 +1,179 @@
-'use client';
+"use client";
 
-import { useState, useEffect, useCallback } from 'react';
-import { Song } from '@/app/types';
+import Image from "next/image";
+import { useDeferredValue, useEffect, useMemo, useState } from "react";
+import type { MusicProvider, SearchSong } from "@/app/types";
+import { appConfig, getEnabledProviders } from "@/lib/qbeat/config";
 
 interface SearchProps {
-  roomId: string;
-  onAddSong: (song: Song) => Promise<void>;
+  onAddSong: (song: SearchSong) => Promise<void>;
 }
 
-export default function Search({ roomId, onAddSong }: SearchProps) {
-  const [query, setQuery] = useState('');
-  const [results, setResults] = useState<Song[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState('');
+function formatDuration(durationSeconds: number | null) {
+  if (!durationSeconds) {
+    return "Unknown";
+  }
 
-  const searchSongs = useCallback(async (searchQuery: string) => {
-    if (!searchQuery.trim()) {
+  const minutes = Math.floor(durationSeconds / 60);
+  const seconds = durationSeconds % 60;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+export default function Search({ onAddSong }: SearchProps) {
+  const enabledProviders = useMemo(() => getEnabledProviders(), []);
+  const [provider, setProvider] = useState<MusicProvider>(enabledProviders[0] ?? "youtube");
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<SearchSong[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState("");
+  const deferredQuery = useDeferredValue(query.trim());
+
+  useEffect(() => {
+    if (!enabledProviders.includes(provider)) {
+      setProvider(enabledProviders[0] ?? "youtube");
+    }
+  }, [enabledProviders, provider]);
+
+  useEffect(() => {
+    const activeQuery = deferredQuery;
+
+    if (!activeQuery) {
       setResults([]);
+      setError("");
       return;
     }
 
-    setIsLoading(true);
-    setError('');
+    const timeoutId = window.setTimeout(async () => {
+      setIsLoading(true);
+      setError("");
 
-    try {
-      const response = await fetch(`/api/youtube/search?q=${encodeURIComponent(searchQuery)}`);
-      if (!response.ok) {
-        throw new Error('Failed to search songs');
+      try {
+        const response = await fetch(
+          `/api/music/search?${new URLSearchParams({
+            q: activeQuery,
+            provider,
+          })}`,
+        );
+
+        if (!response.ok) {
+          const payload = await response.json().catch(() => ({ error: "Search failed." }));
+          throw new Error(payload.error ?? "Search failed.");
+        }
+
+        setResults((await response.json()) as SearchSong[]);
+      } catch (searchError) {
+        setError(searchError instanceof Error ? searchError.message : "Search failed.");
+        setResults([]);
+      } finally {
+        setIsLoading(false);
       }
-      const data = await response.json();
-      setResults(data);
-    } catch (error) {
-      setError('Failed to search songs. Please try again.');
-      setResults([]);
-    } finally {
-      setIsLoading(false);
-    }
-  }, []);
+    }, appConfig.searchDebounceMs);
 
-  // Debounced search effect
-  useEffect(() => {
-    const timeoutId = setTimeout(() => {
-      searchSongs(query);
-    }, 500); // 500ms delay
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [deferredQuery, provider]);
 
-    return () => clearTimeout(timeoutId);
-  }, [query, searchSongs]);
-
-  const handleAddSong = async (song: Song) => {
+  const handleAddSong = async (song: SearchSong) => {
     try {
       await onAddSong(song);
-      // Clear search results after adding
       setResults([]);
-      setQuery('');
-    } catch (error) {
-      setError('Failed to add song. Please try again.');
+      setQuery("");
+    } catch (addError) {
+      setError(addError instanceof Error ? addError.message : "Failed to add track.");
     }
   };
 
   return (
-    <div className="space-y-4">
-      <div className="flex space-x-2">
-        <input
-          type="text"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search for songs..."
-          className="flex-1 px-4 py-2 border border-gray-200 rounded-lg focus:ring-2 focus:ring-[#DD88CF] focus:border-transparent outline-none transition-all duration-200"
-        />
-        {isLoading && (
-          <div className="px-4 py-2 text-[#4B164C] font-semibold">
-            Searching...
+    <section className="glass-panel rounded-[28px] p-4 sm:p-5">
+      <div className="space-y-4">
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-end">
+          <div className="min-w-0 flex-1 space-y-2">
+            <p className="section-kicker">Add song</p>
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder={`Search ${appConfig.providers[provider].label}`}
+              className="w-full border-0 border-b border-[var(--line-strong)] bg-transparent px-0 py-3 text-base text-[var(--text)] outline-none placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] focus:ring-0"
+            />
           </div>
-        )}
-      </div>
 
-      {error && (
-        <div className="bg-red-50 border border-red-200 text-red-600 px-4 py-3 rounded-lg text-sm">
-          {error}
+          <div className="flex flex-wrap gap-2">
+            {enabledProviders.map((enabledProvider) => {
+              const active = provider === enabledProvider;
+              return (
+                <button
+                  key={enabledProvider}
+                  type="button"
+                  onClick={() => setProvider(enabledProvider)}
+                  className={`rounded-full px-4 py-2 text-sm font-semibold transition ${
+                    active
+                      ? "bg-[var(--text)] text-white"
+                      : "border border-[var(--line)] bg-transparent text-[var(--text-muted)] hover:border-[var(--accent)] hover:text-[var(--text)]"
+                  }`}
+                >
+                  {appConfig.providers[enabledProvider].label}
+                </button>
+              );
+            })}
+          </div>
         </div>
-      )}
 
-      {results.length > 0 && (
-        <div className="space-y-2">
-          {results.map((song) => (
-            <div
-              key={song.id}
-              className="flex items-center justify-between p-4 bg-[#F8E7F6] rounded-lg hover:bg-[#DD88CF] hover:text-white transition-colors duration-200"
-            >
-              <div className="flex items-center space-x-4">
-                <img
-                  src={song.image}
-                  alt={song.name}
-                  className="w-12 h-12 rounded-lg"
-                />
-                <div>
-                  <h3 className="font-medium">{song.name}</h3>
-                  <p className="text-sm opacity-75">{song.artist}</p>
-                </div>
-              </div>
-              <button
-                onClick={() => handleAddSong(song)}
-                className="p-2 text-[#4B164C] hover:text-white transition-colors"
+        {isLoading ? <p className="text-sm text-[var(--text-muted)]">Searching...</p> : null}
+
+        {error ? (
+          <div className="rounded-[18px] border border-[rgba(194,64,50,0.18)] bg-[rgba(194,64,50,0.08)] px-4 py-3 text-sm text-[var(--danger)]">
+            {error}
+          </div>
+        ) : null}
+
+        {results.length > 0 ? (
+          <div className="space-y-2 lg:max-h-[15rem] lg:overflow-y-auto lg:pr-1">
+            {results.map((song) => (
+              <article
+                key={`${song.provider}:${song.providerTrackId}`}
+                className="soft-card rounded-[20px] px-3 py-3"
               >
-                <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-                </svg>
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
+                <div className="flex items-center gap-3">
+                  <Image
+                    src={song.thumbnailUrl}
+                    alt={song.title}
+                    width={44}
+                    height={44}
+                    className="h-11 w-11 rounded-[14px] object-cover"
+                  />
+
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-semibold text-[var(--text)]">{song.title}</p>
+                    <p className="truncate text-sm text-[var(--text-muted)]">{song.artist}</p>
+                    <p className="mt-1 text-xs uppercase tracking-[0.14em] text-[var(--text-muted)]">
+                      {formatDuration(song.durationSeconds)}
+                    </p>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => handleAddSong(song)}
+                    className="rounded-full bg-[var(--accent)] px-3 py-2 text-xs font-semibold text-white transition hover:bg-[var(--accent-strong)]"
+                  >
+                    Add
+                  </button>
+                </div>
+              </article>
+            ))}
+          </div>
+        ) : null}
+
+        {!deferredQuery && !isLoading ? (
+          <p className="text-sm text-[var(--text-muted)]">
+            Search for a song and add it straight into the room.
+          </p>
+        ) : null}
+
+        {!isLoading && deferredQuery && results.length === 0 && !error ? (
+          <p className="text-sm text-[var(--text-muted)]">No results found for this search.</p>
+        ) : null}
+      </div>
+    </section>
   );
-} 
+}

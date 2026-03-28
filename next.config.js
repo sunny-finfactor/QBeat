@@ -3,8 +3,8 @@ const nextConfig = {
   reactStrictMode: true,
   swcMinify: true,
   images: {
-    domains: ['i.scdn.co'], // Spotify album art
-  }
-}
+    domains: ['i.ytimg.com', 'img.youtube.com', 'i.scdn.co', 'mosaic.scdn.co'],
+  },
+};
 
-module.exports = nextConfig
+module.exports = nextConfig;

@@ -1,220 +1,477 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
-import { useParams, useRouter } from "next/navigation";
+import Link from "next/link";
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import type { RealtimeChannel } from "@supabase/supabase-js";
+import type { PlaybackState, RoomSnapshot, SearchSong, VoteResult } from "@/app/types";
 import Player from "./components/Player";
-import Search from "./components/Search";
 import Queue from "./components/Queue";
-import { Song } from "@/app/types";
+import Search from "./components/Search";
+import { ensureAnonymousSession } from "@/lib/qbeat/auth";
+import { appConfig } from "@/lib/qbeat/config";
+import { getOrCreateNickname } from "@/lib/qbeat/local-storage";
+import {
+  fetchRoomSnapshot,
+  joinRoom,
+  withOptimisticRemoval,
+  withOptimisticTrack,
+  withOptimisticVote,
+} from "@/lib/qbeat/room-service";
+import { buildRoomSections } from "@/lib/qbeat/room-state";
+import { getSupabaseBrowserClient } from "@/lib/supabase/client";
+
+function getErrorMessage(error: unknown, fallback: string) {
+  if (error && typeof error === "object" && "message" in error && typeof error.message === "string") {
+    return error.message;
+  }
+
+  return fallback;
+}
+
+function withOptimisticPlayback(
+  snapshot: RoomSnapshot,
+  playbackPatch: Partial<PlaybackState>,
+  userId: string,
+) {
+  const now = new Date().toISOString();
+
+  return {
+    ...snapshot,
+    playbackState: {
+      ...snapshot.playbackState,
+      ...playbackPatch,
+      updated_at: now,
+      updated_by: userId,
+      sync_anchor_at: playbackPatch.sync_anchor_at ?? now,
+    },
+  };
+}
 
 export default function RoomPage({ params }: { params: { id: string } }) {
-  const [queue, setQueue] = useState<Song[]>([]);
-  const [playedSongs, setPlayedSongs] = useState<Song[]>([]);
-  const [isAdmin, setIsAdmin] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
-  const eventSourceRef = useRef<EventSource | null>(null);
   const router = useRouter();
+  const supabase = useMemo(() => getSupabaseBrowserClient(), []);
+  const [snapshot, setSnapshot] = useState<RoomSnapshot | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [actionError, setActionError] = useState("");
+  const [nickname, setNickname] = useState("");
+  const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
+  const channelRef = useRef<RealtimeChannel | null>(null);
+  const refreshTimerRef = useRef<number | null>(null);
+  const copyTimerRef = useRef<number | null>(null);
+  const roomIdRef = useRef<string | null>(null);
+  const roleRef = useRef<RoomSnapshot["role"]>("listener");
+  const userIdRef = useRef<string | null>(null);
+
+  const refreshSnapshot = useCallback(async () => {
+    if (!roomIdRef.current || !userIdRef.current) {
+      return;
+    }
+
+    try {
+      const nextSnapshot = await fetchRoomSnapshot(
+        supabase,
+        roomIdRef.current,
+        userIdRef.current,
+        roleRef.current,
+      );
+      startTransition(() => setSnapshot(nextSnapshot));
+    } catch (refreshError) {
+      setActionError(getErrorMessage(refreshError, "Failed to refresh room state."));
+    }
+  }, [supabase]);
+
+  const scheduleRefresh = useCallback(() => {
+    if (refreshTimerRef.current) {
+      return;
+    }
+
+    refreshTimerRef.current = window.setTimeout(() => {
+      refreshTimerRef.current = null;
+      void refreshSnapshot();
+    }, 90);
+  }, [refreshSnapshot]);
 
   useEffect(() => {
-    const fetchRoom = async () => {
+    let cancelled = false;
+
+    async function bootstrapRoom() {
       try {
-        const response = await fetch(`/api/rooms/${params.id}`);
-        if (!response.ok) {
-          throw new Error('Failed to fetch room');
+        const roomCode = params.id.toUpperCase();
+        const displayName = getOrCreateNickname();
+        setNickname(displayName);
+
+        const session = await ensureAnonymousSession(supabase);
+        userIdRef.current = session.user.id;
+
+        const joinedRoom = await joinRoom(supabase, roomCode, displayName);
+        roomIdRef.current = joinedRoom.room_id;
+        roleRef.current = joinedRoom.role;
+
+        const initialSnapshot = await fetchRoomSnapshot(
+          supabase,
+          joinedRoom.room_id,
+          session.user.id,
+          joinedRoom.role,
+        );
+
+        if (cancelled) {
+          return;
         }
 
-        const data = await response.json();
-        setQueue(data.queue);
-        setPlayedSongs(data.playedSongs || []);
-        setIsAdmin(data.isAdmin);
-      } catch (error) {
-        console.error('Error fetching room:', error);
+        setSnapshot(initialSnapshot);
+
+        const channel = supabase
+          .channel(`room:${joinedRoom.room_id}:live`)
+          .on(
+            "postgres_changes",
+            {
+              event: "*",
+              schema: "public",
+              table: "room_tracks",
+              filter: `room_id=eq.${joinedRoom.room_id}`,
+            },
+            scheduleRefresh,
+          )
+          .on(
+            "postgres_changes",
+            {
+              event: "*",
+              schema: "public",
+              table: "playback_state",
+              filter: `room_id=eq.${joinedRoom.room_id}`,
+            },
+            scheduleRefresh,
+          )
+          .on(
+            "postgres_changes",
+            {
+              event: "*",
+              schema: "public",
+              table: "rooms",
+              filter: `id=eq.${joinedRoom.room_id}`,
+            },
+            scheduleRefresh,
+          );
+
+        channel.subscribe();
+        channelRef.current = channel;
+      } catch (roomError) {
+        if (!cancelled) {
+          setError(getErrorMessage(roomError, "Failed to load room."));
+        }
       } finally {
-        setIsLoading(false);
-      }
-    };
-
-    fetchRoom();
-  }, [params.id]);
-
-  useEffect(() => {
-    // Set up SSE connection
-    const eventSource = new EventSource(`/api/rooms/${params.id}/events`);
-    eventSourceRef.current = eventSource;
-
-    eventSource.onmessage = (event) => {
-      try {
-        const { type, data } = JSON.parse(event.data);
-
-        if (type === 'queue-update') {
-          setQueue(data.queue);
-          setPlayedSongs(data.playedSongs || []);
+        if (!cancelled) {
+          setIsLoading(false);
         }
-      } catch (error) {
-        console.error('Error handling SSE message:', error);
       }
-    };
+    }
 
-    eventSource.onerror = (error) => {
-      console.error('SSE error:', error);
-      eventSource.close();
-    };
+    void bootstrapRoom();
 
     return () => {
-      eventSource.close();
+      cancelled = true;
+
+      if (refreshTimerRef.current) {
+        window.clearTimeout(refreshTimerRef.current);
+      }
+
+      if (copyTimerRef.current) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+
+      if (channelRef.current) {
+        void supabase.removeChannel(channelRef.current);
+        channelRef.current = null;
+      }
     };
-  }, [params.id]);
+  }, [params.id, scheduleRefresh, supabase]);
 
-  const handleAddSong = async (song: Song) => {
-    try {
-      const response = await fetch(`/api/rooms/${params.id}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'add-song',
-          data: { song }
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to add song');
-      }
-
-      const { queue } = await response.json();
-      setQueue(queue);
-    } catch (error) {
-      console.error('Error adding song:', error);
+  const handleAddSong = async (song: SearchSong) => {
+    if (!snapshot || !userIdRef.current) {
+      return;
     }
-  };
 
-  const handleVote = async (songId: string, vote: number) => {
-    try {
-      const response = await fetch(`/api/rooms/${params.id}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'vote-song',
-          data: { songId, vote }
-        })
-      });
+    setActionError("");
+    setSnapshot((current) => (current ? withOptimisticTrack(current, song, userIdRef.current as string) : current));
 
-      if (!response.ok) {
-        throw new Error('Failed to vote for song');
-      }
-    } catch (err) {
-      throw new Error('Failed to vote for song');
+    const { error: addError } = await supabase.rpc("add_track_to_room", {
+      p_room_id: snapshot.room.id,
+      p_provider: song.provider,
+      p_provider_track_id: song.providerTrackId,
+      p_title: song.title,
+      p_artist: song.artist,
+      p_thumbnail_url: song.thumbnailUrl,
+      p_duration_seconds: song.durationSeconds,
+    });
+
+    if (addError) {
+      await refreshSnapshot();
+      throw new Error(addError.message);
     }
+
+    await refreshSnapshot();
   };
 
-  const handleQueueUpdate = (newQueue: Song[], newPlayedSongs: Song[]) => {
-    setQueue(newQueue);
-    setPlayedSongs(newPlayedSongs);
+  const handleVote = async (roomTrackId: string) => {
+    if (!snapshot) {
+      return;
+    }
+
+    setActionError("");
+    setSnapshot((current) => (current ? withOptimisticVote(current, roomTrackId) : current));
+
+    const { data, error: voteError } = await supabase
+      .rpc("upvote_track", { p_room_track_id: roomTrackId })
+      .single();
+
+    const voteResult = (data ?? null) as VoteResult | null;
+
+    if (voteError || !voteResult?.applied) {
+      await refreshSnapshot();
+      setActionError(voteError?.message ?? "Permanent vote already used on this track.");
+      return;
+    }
+
+    await refreshSnapshot();
   };
 
-  const handleReplaySong = async (songId: string) => {
+  const handleRemove = async (roomTrackId: string) => {
+    if (!snapshot) {
+      return;
+    }
+
+    setActionError("");
+    setSnapshot((current) => (current ? withOptimisticRemoval(current, roomTrackId) : current));
+
+    const { error: removeError } = await supabase.rpc("remove_track_from_room", {
+      p_room_track_id: roomTrackId,
+    });
+
+    if (removeError) {
+      await refreshSnapshot();
+      setActionError(removeError.message);
+      return;
+    }
+
+    await refreshSnapshot();
+  };
+
+  const handleTogglePlayback = async (action: "pause" | "resume", positionSeconds: number) => {
+    if (!snapshot || !userIdRef.current) {
+      return;
+    }
+
+    setActionError("");
+    setSnapshot((current) =>
+      current
+        ? withOptimisticPlayback(
+            current,
+            {
+              is_playing: action === "resume",
+              position_seconds: positionSeconds,
+            },
+            userIdRef.current as string,
+          )
+        : current,
+    );
+
+    const { error: playbackError } = await supabase.rpc("set_room_playback", {
+      p_room_id: snapshot.room.id,
+      p_action: action,
+      p_position_seconds: positionSeconds,
+    });
+
+    if (playbackError) {
+      await refreshSnapshot();
+      setActionError(playbackError.message);
+      return;
+    }
+
+    await refreshSnapshot();
+  };
+
+  const handleSeek = async (positionSeconds: number) => {
+    if (!snapshot || !userIdRef.current) {
+      return;
+    }
+
+    setActionError("");
+    setSnapshot((current) =>
+      current
+        ? withOptimisticPlayback(
+            current,
+            {
+              position_seconds: positionSeconds,
+            },
+            userIdRef.current as string,
+          )
+        : current,
+    );
+
+    const { error: seekError } = await supabase.rpc("set_room_playback", {
+      p_room_id: snapshot.room.id,
+      p_action: "seek",
+      p_position_seconds: positionSeconds,
+    });
+
+    if (seekError) {
+      await refreshSnapshot();
+      setActionError(seekError.message);
+      return;
+    }
+
+    await refreshSnapshot();
+  };
+
+  const handleSkip = async () => {
+    if (!snapshot) {
+      return;
+    }
+
+    setActionError("");
+    const { error: skipError } = await supabase.rpc("skip_current_track", {
+      p_room_id: snapshot.room.id,
+    });
+
+    if (skipError) {
+      setActionError(skipError.message);
+      return;
+    }
+
+    await refreshSnapshot();
+  };
+
+  const handleCopyCode = async () => {
+    if (!snapshot) {
+      return;
+    }
+
     try {
-      const response = await fetch(`/api/rooms/${params.id}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'replay-song',
-          data: { songId }
-        })
-      });
+      await navigator.clipboard.writeText(snapshot.room.code);
+      setCopyState("copied");
 
-      if (!response.ok) {
-        throw new Error('Failed to replay song');
+      if (copyTimerRef.current) {
+        window.clearTimeout(copyTimerRef.current);
       }
 
-      const { queue } = await response.json();
-      setQueue(queue);
-    } catch (error) {
-      console.error('Error replaying song:', error);
+      copyTimerRef.current = window.setTimeout(() => {
+        setCopyState("idle");
+      }, 1800);
+    } catch {
+      setActionError("Room code copy failed.");
     }
   };
 
   if (isLoading) {
     return (
-      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
-        <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-[#4B164C]"></div>
-      </div>
+      <main className="flex min-h-screen items-center justify-center px-4">
+        <div className="glass-panel rounded-[28px] px-6 py-5 text-sm text-[var(--text-muted)]">
+          Joining room...
+        </div>
+      </main>
     );
   }
 
-  if (error) {
+  if (error || !snapshot) {
     return (
-      <div className="min-h-screen bg-[#F5F5F5] flex items-center justify-center p-4">
-        <div className="bg-white rounded-2xl shadow-lg p-8 text-center">
-          <h2 className="text-2xl font-bold text-[#4B164C] mb-4">Oops!</h2>
-          <p className="text-gray-600">{error}</p>
-          <p className="text-gray-500 mt-2">Redirecting to home...</p>
+      <main className="flex min-h-screen items-center justify-center px-4">
+        <div className="glass-panel max-w-md rounded-[28px] p-6 text-center">
+          <p className="section-kicker">Room error</p>
+          <h1 className="mt-3 text-2xl font-semibold text-[var(--text)]">
+            {error || "This room is unavailable."}
+          </h1>
+          <button
+            type="button"
+            onClick={() => router.push("/")}
+            className="mt-6 rounded-full bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white transition hover:bg-[var(--accent-strong)]"
+          >
+            Back home
+          </button>
         </div>
-      </div>
+      </main>
     );
   }
+
+  const sections = buildRoomSections(snapshot.tracks);
+  const isHost = snapshot.role === "host";
 
   return (
-    <div className="min-h-screen bg-gray-50">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-          {/* Search Section */}
-          <div className="lg:col-span-1">
-            <Search onAddSong={handleAddSong} roomId={params.id} />
+    <main className="min-h-screen px-4 py-4 sm:px-6 sm:py-6 lg:px-8">
+      <div className="mx-auto flex max-w-7xl flex-col gap-6">
+        <header className="grid gap-4 border-b border-[var(--line)] pb-5 xl:grid-cols-[0.78fr_1fr_1fr] xl:items-center">
+          <div className="flex items-center justify-between xl:justify-start">
+            <Link href="/" className="text-2xl font-semibold tracking-tight text-[var(--text)]">
+              QBeat
+            </Link>
+            <span className="text-sm text-[var(--text-muted)] xl:hidden">{snapshot.role}</span>
           </div>
 
-          {/* Queue Section */}
-          <div className="lg:col-span-2">
-            <div className="bg-white rounded-lg shadow-lg p-6">
-              <h2 className="text-2xl font-bold text-[#4B164C] mb-6">Queue</h2>
-              <Queue queue={queue} roomId={params.id} isAdmin={isAdmin} />
+          <div className="text-center">
+            <p className="section-kicker">Live room</p>
+            <h1 className="display-font mt-2 text-4xl text-[var(--text)] sm:text-5xl">
+              Room {snapshot.room.code}
+            </h1>
+            <p className="mt-2 text-sm text-[var(--text-muted)]">
+              Share the code and shape the queue together.
+            </p>
+          </div>
+
+          <div className="space-y-3 xl:text-right">
+            <div className="flex flex-wrap gap-2 xl:justify-end">
+              <span className="badge-chip">{nickname}</span>
+              <span className="badge-chip">{snapshot.role}</span>
+              <span className="badge-chip">{appConfig.voteMode}</span>
             </div>
-
-            {/* Played Songs Section */}
-            {playedSongs.length > 0 && (
-              <div className="bg-white rounded-lg shadow-lg p-6 mt-8">
-                <h2 className="text-2xl font-bold text-[#4B164C] mb-6">Played Songs</h2>
-                <div className="space-y-4">
-                  {playedSongs.map((song) => (
-                    <div
-                      key={song.id}
-                      className="flex items-center justify-between p-4 bg-gray-50 rounded-lg"
-                    >
-                      <div className="flex items-center space-x-4">
-                        <img
-                          src={song.image}
-                          alt={song.name}
-                          className="w-12 h-12 rounded-lg"
-                        />
-                        <div>
-                          <h3 className="font-medium text-[#4B164C]">{song.name}</h3>
-                          <p className="text-sm text-gray-500">{song.artist}</p>
-                        </div>
-                      </div>
-                      <button
-                        onClick={() => handleReplaySong(song.id)}
-                        className="p-2 text-[#4B164C] hover:text-[#DD88CF] transition-colors"
-                      >
-                        <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                        </svg>
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
+            <p className="text-sm leading-6 text-[var(--text-muted)]">
+              {isHost ? "You control playback." : "The host controls playback."} Rooms expire after{" "}
+              {appConfig.roomExpiryHours} hours of inactivity.
+            </p>
+            <div className="flex xl:justify-end">
+              <button
+                type="button"
+                onClick={handleCopyCode}
+                className="rounded-full border border-[var(--line-strong)] bg-transparent px-4 py-2.5 text-sm font-semibold text-[var(--text)] transition hover:border-[var(--accent)] hover:bg-white/40"
+              >
+                {copyState === "copied" ? "Code copied" : "Copy room code"}
+              </button>
+            </div>
           </div>
+        </header>
+
+        {actionError ? (
+          <div className="rounded-[24px] border border-[rgba(194,64,50,0.18)] bg-[rgba(194,64,50,0.08)] px-4 py-3 text-sm text-[var(--danger)]">
+            {actionError}
+          </div>
+        ) : null}
+
+        <div className="grid gap-6 xl:grid-cols-[1.45fr_0.9fr] xl:items-start">
+          <section className="order-1 space-y-5">
+            <Search onAddSong={handleAddSong} />
+            <Player
+              currentTrack={sections.currentTrack}
+              playbackState={snapshot.playbackState}
+              isHost={isHost}
+              onTogglePlayback={handleTogglePlayback}
+              onSeek={handleSeek}
+              onSkip={handleSkip}
+            />
+          </section>
+
+          <aside className="order-2">
+            <Queue
+              upNextTrack={sections.upNextTrack}
+              queuedTracks={sections.queuedTracks}
+              playedTracks={sections.playedTracks}
+              votedTrackIds={snapshot.votedTrackIds}
+              isHost={isHost}
+              onVote={handleVote}
+              onRemove={handleRemove}
+            />
+          </aside>
         </div>
       </div>
-
-      {/* Player */}
-      <Player
-        queue={queue}
-        isAdmin={isAdmin}
-        roomId={params.id}
-        onQueueUpdate={handleQueueUpdate}
-      />
-    </div>
+    </main>
   );
 }

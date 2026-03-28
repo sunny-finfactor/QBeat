@@ -1,61 +1,75 @@
 "use client";
 
-import { useState, useEffect, useRef } from 'react';
-import { Song } from '@/app/types';
+import Image from "next/image";
+import { useEffect, useRef, useState } from "react";
+import type { PlaybackState, RoomTrack } from "@/app/types";
+import { derivePlaybackPosition } from "@/lib/qbeat/room-state";
 
 interface PlayerProps {
-  queue: Song[];
-  isAdmin: boolean;
-  roomId: string;
-  onQueueUpdate?: (queue: Song[], playedSongs: Song[]) => void;
+  currentTrack: RoomTrack | null;
+  playbackState: PlaybackState | null;
+  isHost: boolean;
+  onTogglePlayback: (action: "pause" | "resume", positionSeconds: number) => Promise<void>;
+  onSeek: (positionSeconds: number) => Promise<void>;
+  onSkip: () => Promise<void>;
 }
 
-export default function Player({ queue, isAdmin, roomId, onQueueUpdate }: PlayerProps) {
-  const [currentSong, setCurrentSong] = useState<Song | null>(null);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [volume, setVolume] = useState(100);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(0);
+function formatTime(value: number) {
+  const safeValue = Math.max(0, Math.floor(value));
+  const minutes = Math.floor(safeValue / 60);
+  const seconds = safeValue % 60;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+export default function Player({
+  currentTrack,
+  playbackState,
+  isHost,
+  onTogglePlayback,
+  onSeek,
+  onSkip,
+}: PlayerProps) {
   const playerRef = useRef<YT.Player | null>(null);
-  const eventSourceRef = useRef<EventSource | null>(null);
-  const isPlayerReady = useRef(false);
-  const currentSongRef = useRef<Song | null>(null);
-  const progressIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const lastTrackIdRef = useRef<string | null>(null);
+  const readyRef = useRef(false);
+  const progressTimerRef = useRef<number | null>(null);
+  const onSkipRef = useRef(onSkip);
+  const volumeRef = useRef(85);
+  const [duration, setDuration] = useState(0);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [volume, setVolume] = useState(85);
 
-  // Load YouTube IFrame API
   useEffect(() => {
-    if (typeof window === 'undefined') return;
+    onSkipRef.current = onSkip;
+  }, [onSkip]);
 
-    // Check if the API is already loaded
-    if (window.YT && window.YT.Player) {
-      initializePlayer();
+  useEffect(() => {
+    volumeRef.current = volume;
+  }, [volume]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
       return;
     }
 
-    // Load the IFrame Player API code asynchronously
-    const tag = document.createElement('script');
-    tag.src = 'https://www.youtube.com/iframe_api';
-    const firstScriptTag = document.getElementsByTagName('script')[0];
-    firstScriptTag.parentNode?.insertBefore(tag, firstScriptTag);
+    const cleanup = () => {
+      if (progressTimerRef.current) {
+        window.clearInterval(progressTimerRef.current);
+      }
 
-    // Create YouTube player when API is ready
-    window.onYouTubeIframeAPIReady = initializePlayer;
-
-    return () => {
       if (playerRef.current) {
         playerRef.current.destroy();
       }
-      if (progressIntervalRef.current) {
-        clearInterval(progressIntervalRef.current);
-      }
     };
-  }, []);
 
-  const initializePlayer = () => {
-    if (!playerRef.current) {
-      playerRef.current = new window.YT.Player('youtube-player', {
-        height: '0',
-        width: '0',
+    const ensurePlayer = () => {
+      if (playerRef.current) {
+        return;
+      }
+
+      playerRef.current = new window.YT.Player("qbeat-youtube-player", {
+        height: "0",
+        width: "0",
         playerVars: {
           autoplay: 0,
           controls: 0,
@@ -66,332 +80,312 @@ export default function Player({ queue, isAdmin, roomId, onQueueUpdate }: Player
           rel: 0,
         },
         events: {
+          onReady: () => {
+            readyRef.current = true;
+            playerRef.current?.setVolume(volumeRef.current);
+          },
           onStateChange: (event) => {
-            if (event.data === window.YT.PlayerState.ENDED) {
-              handleNext();
-            } else if (event.data === window.YT.PlayerState.PLAYING) {
-              setIsPlaying(true);
-              startProgressTracking();
-            } else if (event.data === window.YT.PlayerState.PAUSED) {
-              setIsPlaying(false);
-              stopProgressTracking();
+            if (!playerRef.current) {
+              return;
+            }
+
+            if (event.data === window.YT.PlayerState.PLAYING) {
+              setDuration(playerRef.current.getDuration() || 0);
+            }
+
+            if (event.data === window.YT.PlayerState.ENDED && isHost) {
+              void onSkipRef.current();
             }
           },
-          onReady: () => {
-            console.log('YouTube player is ready');
-            isPlayerReady.current = true;
-            if (playerRef.current) {
-              playerRef.current.setVolume(volume);
-            }
-          }
-        }
+        },
       });
+    };
+
+    if (window.YT?.Player) {
+      ensurePlayer();
+    } else {
+      const script = document.createElement("script");
+      script.src = "https://www.youtube.com/iframe_api";
+      document.body.appendChild(script);
+      window.onYouTubeIframeAPIReady = ensurePlayer;
     }
-  };
 
-  // Handle playback state updates
+    return cleanup;
+  }, [isHost]);
+
   useEffect(() => {
-    const eventSource = new EventSource(`/api/rooms/${roomId}/events`);
-    eventSourceRef.current = eventSource;
+    if (!playerRef.current || !readyRef.current) {
+      return;
+    }
 
-    eventSource.onmessage = (event) => {
-      try {
-        const { type, data } = JSON.parse(event.data);
+    playerRef.current.setVolume(volume);
+  }, [volume]);
 
-        if (type === 'playback-state') {
-          if (data.currentSongId) {
-            const song = queue.find(s => s.id === data.currentSongId);
-            if (song && song.youtubeId && playerRef.current && isPlayerReady.current) {
-              // Only update if it's a different song
-              if (currentSongRef.current?.id !== song.id) {
-                setCurrentSong(song);
-                currentSongRef.current = song;
-                playerRef.current.loadVideoById(song.youtubeId);
-                if (data.isPlaying) {
-                  playerRef.current.seekTo(data.currentTime || 0, true);
-                  playerRef.current.playVideo();
-                } else {
-                  playerRef.current.pauseVideo();
-                }
-              } else if (data.isPlaying !== isPlaying) {
-                // Only update play/pause state if the song is the same
-                if (data.isPlaying) {
-                  playerRef.current.playVideo();
-                } else {
-                  playerRef.current.pauseVideo();
-                }
-              }
-              setIsPlaying(data.isPlaying);
-            }
-          }
-        } else if (type === 'queue-update') {
-          // Update the queue and check if we need to play the next song
-          if (data.queue.length > 0) {
-            const nextSong = data.queue[0];
-            if (nextSong && nextSong.id !== currentSongRef.current?.id) {
-              setCurrentSong(nextSong);
-              currentSongRef.current = nextSong;
-              if (playerRef.current && isPlayerReady.current) {
-                playerRef.current.loadVideoById(nextSong.youtubeId);
-                playerRef.current.playVideo();
-                setIsPlaying(true);
-              }
-            }
-          }
-        }
-      } catch (error) {
-        console.error('Error handling SSE message:', error);
+  useEffect(() => {
+    if (progressTimerRef.current) {
+      window.clearInterval(progressTimerRef.current);
+    }
+
+    progressTimerRef.current = window.setInterval(() => {
+      if (!playerRef.current || !readyRef.current) {
+        return;
       }
-    };
 
-    eventSource.onerror = (error) => {
-      console.error('SSE error:', error);
-      eventSource.close();
-    };
+      setCurrentTime(playerRef.current.getCurrentTime() || 0);
+      setDuration(playerRef.current.getDuration() || 0);
+    }, 500);
 
     return () => {
-      eventSource.close();
+      if (progressTimerRef.current) {
+        window.clearInterval(progressTimerRef.current);
+      }
     };
-  }, [roomId, queue]);
+  }, []);
 
-  const startProgressTracking = () => {
-    if (progressIntervalRef.current) {
-      clearInterval(progressIntervalRef.current);
+  useEffect(() => {
+    if (!currentTrack || !playbackState || !playerRef.current || !readyRef.current) {
+      return;
     }
-    progressIntervalRef.current = setInterval(() => {
-      if (playerRef.current && isPlayerReady.current) {
-        const currentTime = playerRef.current.getCurrentTime();
-        setCurrentTime(currentTime);
-      }
-    }, 1000);
-  };
 
-  const stopProgressTracking = () => {
-    if (progressIntervalRef.current) {
-      clearInterval(progressIntervalRef.current);
-      progressIntervalRef.current = null;
-    }
-  };
+    const player = playerRef.current;
+    const targetPosition = derivePlaybackPosition(playbackState);
+    const activeTrackChanged = lastTrackIdRef.current !== currentTrack.id;
 
-  const formatTime = (seconds: number) => {
-    const minutes = Math.floor(seconds / 60);
-    const remainingSeconds = Math.floor(seconds % 60);
-    return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
-  };
-
-  const handleProgressChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (!isAdmin || !playerRef.current || !isPlayerReady.current) return;
-
-    const newTime = parseFloat(e.target.value);
-    setCurrentTime(newTime);
-    playerRef.current.seekTo(newTime, true);
-
-    try {
-      const response = await fetch(`/api/rooms/${roomId}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'seek-song',
-          data: { time: newTime }
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to update playback time');
-      }
-    } catch (error) {
-      console.error('Error updating playback time:', error);
-    }
-  };
-
-  const handlePlayPause = async () => {
-    if (!isAdmin || !currentSong) return;
-
-    try {
-      const response = await fetch(`/api/rooms/${roomId}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: isPlaying ? 'pause-song' : 'resume-song',
-          data: { songId: currentSong.id }
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to update playback state');
-      }
-    } catch (error) {
-      console.error('Error updating playback state:', error);
-    }
-  };
-
-  const handleNext = async () => {
-    if (!isAdmin) return;
-
-    try {
-      const response = await fetch(`/api/rooms/${roomId}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'next-song'
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to skip to next song');
+    if (activeTrackChanged) {
+      lastTrackIdRef.current = currentTrack.id;
+      if (currentTrack.provider === "youtube") {
+        player.loadVideoById(currentTrack.provider_track_id, targetPosition);
       }
 
-      const { queue, playedSongs, playbackState } = await response.json();
-      
-      // Update the queue and played songs in the parent component
-      if (onQueueUpdate) {
-        onQueueUpdate(queue, playedSongs);
+      if (!playbackState.is_playing) {
+        window.setTimeout(() => {
+          player.pauseVideo();
+          player.seekTo(targetPosition, true);
+        }, 120);
       }
-    } catch (error) {
-      console.error('Error skipping to next song:', error);
+
+      return;
     }
-  };
 
-  const handlePrevious = async () => {
-    if (!isAdmin) return;
+    const livePosition = player.getCurrentTime() || 0;
+    const drift = Math.abs(livePosition - targetPosition);
+    const playerState = player.getPlayerState();
 
-    try {
-      const response = await fetch(`/api/rooms/${roomId}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'previous-song'
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to go to previous song');
-      }
-    } catch (error) {
-      console.error('Error going to previous song:', error);
+    if (drift > 1.5) {
+      player.seekTo(targetPosition, true);
     }
-  };
 
-  if (!currentSong) {
-    return null;
+    if (playbackState.is_playing && playerState !== window.YT.PlayerState.PLAYING) {
+      player.playVideo();
+    }
+
+    if (!playbackState.is_playing && playerState === window.YT.PlayerState.PLAYING) {
+      player.pauseVideo();
+    }
+  }, [currentTrack, playbackState]);
+
+  if (!currentTrack) {
+    return (
+      <section className="glass-panel overflow-hidden rounded-[40px]">
+        <div className="relative isolate min-h-[520px] overflow-hidden rounded-[40px] px-6 py-8 sm:px-8">
+          <div className="absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(239,98,61,0.16),transparent_28%),radial-gradient(circle_at_bottom_right,rgba(20,117,110,0.14),transparent_30%),linear-gradient(145deg,rgba(255,255,255,0.88),rgba(255,248,239,0.76))]" />
+          <div className="relative flex h-full min-h-[440px] flex-col items-center justify-center text-center">
+            <div className="mb-8 flex h-40 w-40 items-center justify-center rounded-[36px] border border-[rgba(255,255,255,0.6)] bg-[rgba(255,255,255,0.42)] shadow-[var(--shadow)] backdrop-blur">
+              <div className="h-20 w-20 rounded-full border border-[var(--line)] bg-[rgba(36,22,15,0.06)]" />
+            </div>
+            <p className="section-kicker">Currently playing</p>
+            <h2 className="mt-4 text-3xl font-semibold text-[var(--text)]">
+              The room is waiting for the first song.
+            </h2>
+            <p className="mt-3 max-w-xl text-sm leading-6 text-[var(--text-muted)]">
+              Add a track from the search bar. Once the room has its first song, this panel turns
+              into the live player for everyone.
+            </p>
+          </div>
+        </div>
+        <div id="qbeat-youtube-player" className="hidden" />
+      </section>
+    );
   }
 
+  const derivedPosition = playbackState ? derivePlaybackPosition(playbackState) : currentTime;
+  const isPlaying = playbackState?.is_playing ?? false;
+  const displayDuration = duration || currentTrack.duration_seconds || 0;
+  const handleJump = (deltaSeconds: number) => {
+    const currentPosition = playerRef.current?.getCurrentTime() ?? derivedPosition;
+    const nextPosition = Math.max(0, Math.min(currentPosition + deltaSeconds, Math.max(displayDuration, 0)));
+
+    setCurrentTime(nextPosition);
+
+    if (playerRef.current && readyRef.current) {
+      playerRef.current.seekTo(nextPosition, true);
+    }
+
+    if (isHost) {
+      void onSeek(nextPosition);
+    }
+  };
+
   return (
-    <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 shadow-lg">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
-        <div className="flex flex-col space-y-4">
-          {/* Progress Bar */}
-          <div className="flex items-center space-x-2">
-            <span className="text-sm text-gray-500 w-12">{formatTime(currentTime)}</span>
-            <input
-              type="range"
-              min="0"
-              max={duration || 100}
-              value={currentTime}
-              onChange={handleProgressChange}
-              className="flex-1 h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-[#DD88CF]"
-              disabled={!isAdmin}
-            />
-            <span className="text-sm text-gray-500 w-12">{formatTime(duration)}</span>
+    <section className="glass-panel overflow-hidden rounded-[40px]">
+      <div className="relative isolate overflow-hidden rounded-[40px]">
+        <div className="absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(239,98,61,0.18),transparent_24%),radial-gradient(circle_at_85%_18%,rgba(20,117,110,0.15),transparent_24%),linear-gradient(145deg,rgba(255,255,255,0.92),rgba(255,248,239,0.82))]" />
+        <div className="relative px-5 py-6 sm:px-8 sm:py-8">
+          <div className="flex flex-wrap items-center justify-center gap-2">
+            <span className="badge-chip bg-[rgba(239,98,61,0.1)] text-[var(--accent-strong)]">
+              Currently Playing
+            </span>
+            <span className="badge-chip">{currentTrack.provider}</span>
+            <span className="badge-chip">{isPlaying ? "Live" : "Paused"}</span>
           </div>
 
-          <div className="flex items-center justify-between">
-            {/* Current Song Info */}
-            <div className="flex items-center space-x-4">
-              {currentSong && (
-                <>
-                  <img
-                    src={currentSong.image}
-                    alt={currentSong.name}
-                    className="w-16 h-16 rounded-lg shadow-md"
-                  />
-                  <div>
-                    <h3 className="font-semibold text-[#4B164C]">{currentSong.name}</h3>
-                    <p className="text-sm text-gray-600">{currentSong.artist}</p>
-                  </div>
-                </>
-              )}
+          <div className="mt-8 flex flex-col items-center text-center">
+            <div className="relative w-full max-w-[320px] sm:max-w-[380px] lg:max-w-[420px]">
+              <div className="absolute inset-4 rounded-[40px] bg-[rgba(239,98,61,0.16)] blur-3xl" />
+              <div className="relative overflow-hidden rounded-[40px] border border-[rgba(255,255,255,0.58)] bg-[rgba(255,255,255,0.36)] p-3 shadow-[var(--shadow)] backdrop-blur">
+                <Image
+                  src={currentTrack.thumbnail_url}
+                  alt={currentTrack.title}
+                  width={420}
+                  height={420}
+                  className="aspect-square w-full rounded-[30px] object-cover"
+                />
+              </div>
             </div>
 
-            {/* Player Controls */}
-            <div className="flex items-center space-x-6">
-              {isAdmin && (
-                <button
-                  onClick={handlePrevious}
-                  className="p-2 text-[#4B164C] hover:text-[#DD88CF] transition-colors"
-                >
-                  <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-                  </svg>
-                </button>
-              )}
+            <div className="mt-6 flex w-full max-w-3xl flex-col items-center space-y-3">
+              <h2 className="text-3xl font-semibold leading-tight text-[var(--text)] sm:text-4xl lg:text-5xl">
+                {currentTrack.title}
+              </h2>
+              <p className="text-base text-[var(--text-muted)] sm:text-lg">{currentTrack.artist}</p>
+              <p className="max-w-2xl text-sm leading-6 text-[var(--text-muted)]">
+                {isHost
+                  ? "You are controlling the live playback state for everyone in the room."
+                  : "The host is controlling playback while the room votes on what comes next."}
+              </p>
 
-              {isAdmin && (
-                <button
-                  onClick={handlePlayPause}
-                  className="p-2 text-[#4B164C] hover:text-[#DD88CF] transition-colors"
-                >
-                  {isPlaying ? (
-                    <svg className="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-                    </svg>
-                  ) : (
-                    <svg className="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                    </svg>
-                  )}
-                </button>
-              )}
-
-              {isAdmin && (
-                <button
-                  onClick={handleNext}
-                  className="p-2 text-[#4B164C] hover:text-[#DD88CF] transition-colors"
-                >
-                  <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                  </svg>
-                </button>
-              )}
+              {currentTrack.provider !== "youtube" ? (
+                <div className="mt-2 rounded-[22px] border border-[var(--line)] bg-white/70 px-4 py-3 text-sm text-[var(--text-muted)]">
+                  This build currently renders playback only through the YouTube player.
+                </div>
+              ) : null}
             </div>
+          </div>
+        </div>
 
-            {/* Volume Control */}
-            <div className="flex items-center space-x-4">
-              <button
-                onClick={() => setVolume(volume === 0 ? 100 : 0)}
-                className="p-2 text-[#4B164C] hover:text-[#DD88CF] transition-colors"
-              >
-                {volume === 0 ? (
-                  <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2" />
-                  </svg>
-                ) : volume < 50 ? (
-                  <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15.536a5 5 0 001.414 1.414m2.828-9.9a9 9 0 012.728-2.728" />
-                  </svg>
-                ) : (
-                  <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15.536a5 5 0 001.414 1.414m2.828-9.9a9 9 0 012.728-2.728" />
-                  </svg>
-                )}
-              </button>
+        <div className="relative border-t border-[var(--line)] bg-[rgba(255,255,255,0.56)] px-6 py-5 backdrop-blur sm:px-8">
+          <div className="space-y-5">
+            <div className="space-y-3">
+              <div className="flex items-center justify-between text-sm text-[var(--text-muted)]">
+                <span>{formatTime(derivedPosition)}</span>
+                <span>{formatTime(displayDuration)}</span>
+              </div>
               <input
                 type="range"
                 min="0"
-                max="100"
-                value={volume}
-                onChange={(e) => setVolume(parseInt(e.target.value))}
-                className="w-24 accent-[#DD88CF]"
+                max={Math.max(displayDuration, Math.ceil(derivedPosition), 1)}
+                value={Math.min(derivedPosition, Math.max(displayDuration, 1))}
+                step="1"
+                onChange={(event) => {
+                  const nextValue = Number(event.target.value);
+                  setCurrentTime(nextValue);
+                  if (playerRef.current && readyRef.current) {
+                    playerRef.current.seekTo(nextValue, true);
+                  }
+                }}
+                onMouseUp={(event) => {
+                  if (!isHost) {
+                    return;
+                  }
+
+                  void onSeek(Number((event.target as HTMLInputElement).value));
+                }}
+                onTouchEnd={(event) => {
+                  if (!isHost) {
+                    return;
+                  }
+
+                  void onSeek(Number((event.target as HTMLInputElement).value));
+                }}
+                disabled={!isHost}
+                className="h-2 w-full cursor-pointer appearance-none rounded-full bg-[rgba(36,22,15,0.12)] accent-[var(--accent)] disabled:cursor-not-allowed"
               />
+            </div>
+
+            <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
+              <div className="flex flex-wrap items-center justify-center gap-3 lg:justify-start">
+                <button
+                  type="button"
+                  disabled={!isHost}
+                  onClick={() => handleJump(-10)}
+                  className={`flex h-12 items-center justify-center rounded-full px-4 text-sm font-semibold transition ${
+                    isHost
+                      ? "border border-[var(--line-strong)] bg-white/50 text-[var(--text)] hover:border-[var(--accent)] hover:bg-white/80"
+                      : "cursor-not-allowed border border-[var(--line)] bg-white text-[var(--text-muted)]"
+                  }`}
+                >
+                  -10s
+                </button>
+
+                <button
+                  type="button"
+                  disabled={!isHost}
+                  onClick={() =>
+                    void onTogglePlayback(isPlaying ? "pause" : "resume", playerRef.current?.getCurrentTime() ?? 0)
+                  }
+                  className={`flex h-14 min-w-[9rem] items-center justify-center rounded-full px-6 text-sm font-semibold transition ${
+                    isHost
+                      ? "bg-[var(--text)] text-white shadow-[var(--shadow-soft)] hover:bg-[var(--accent-strong)]"
+                      : "cursor-not-allowed border border-[var(--line)] bg-white text-[var(--text-muted)]"
+                  }`}
+                >
+                  {isPlaying ? "Pause Room" : "Play Room"}
+                </button>
+
+                <button
+                  type="button"
+                  disabled={!isHost}
+                  onClick={() => handleJump(10)}
+                  className={`flex h-12 items-center justify-center rounded-full px-4 text-sm font-semibold transition ${
+                    isHost
+                      ? "border border-[var(--line-strong)] bg-white/50 text-[var(--text)] hover:border-[var(--accent)] hover:bg-white/80"
+                      : "cursor-not-allowed border border-[var(--line)] bg-white text-[var(--text-muted)]"
+                  }`}
+                >
+                  +10s
+                </button>
+
+                <button
+                  type="button"
+                  disabled={!isHost}
+                  onClick={() => void onSkip()}
+                  className={`flex h-12 items-center justify-center rounded-full px-5 text-sm font-semibold transition ${
+                    isHost
+                      ? "border border-[var(--line-strong)] bg-transparent text-[var(--text)] hover:border-[var(--accent)] hover:bg-white/40"
+                      : "cursor-not-allowed border border-[var(--line)] bg-white text-[var(--text-muted)]"
+                  }`}
+                >
+                  Skip Track
+                </button>
+              </div>
+
+              <div className="flex items-center justify-center gap-4 lg:justify-end">
+                <span className="text-sm font-medium text-[var(--text-muted)]">Volume</span>
+                <input
+                  type="range"
+                  min="0"
+                  max="100"
+                  step="1"
+                  value={volume}
+                  onChange={(event) => setVolume(Number(event.target.value))}
+                  className="h-2 w-36 cursor-pointer appearance-none rounded-full bg-[rgba(36,22,15,0.12)] accent-[var(--accent)]"
+                />
+              </div>
             </div>
           </div>
         </div>
       </div>
-
-      {/* Hidden YouTube player */}
-      <div id="youtube-player" className="hidden"></div>
-    </div>
+      <div id="qbeat-youtube-player" className="hidden" />
+    </section>
   );
 }
